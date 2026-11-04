@@ -66,3 +66,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# IDE
+.idea/
+
+# graphify knowledge graph output
+graphify-out/
+
+# local config (example committed; real deployment config not)
+config/time.yaml

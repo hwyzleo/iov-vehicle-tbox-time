@@ -1,0 +1,60 @@
+# TBOX-TIME 示例配置。
+#
+# production：真实 NTP（Wi-Fi/以太网承载）+ Linux 系统时钟后端（唯一写入方）。
+# 测试/本地开发：profile: test + backend.mode: mock + NTP 指向本地 mock 服务器。
+#
+# 完整 schema 与默认值：docs/config_schema.md。
+
+time:
+  profile: production
+
+  ipc:
+    socket_path: /tmp/tbox-time.sock
+    event_queue_limit: 1024
+
+  backend:
+    mode: linux            # linux | mock(仅 test) | chrony(扩展点,拒绝)
+    allow_competing_writers: false   # 检测到 chronyd/ntpd 等 → FAULT（唯一写入方）
+
+  core:
+    max_source_age_ms: 300000
+    max_source_error_ms: 500
+    require_authenticated_sources: false   # 未认证 NTP 允许非安全同步（证据保持 unverified）
+    stability_window_syncs: 3
+    switch_hysteresis_ms: 2000
+    step_threshold_ms: 1000
+    slew_threshold_ms: 50
+    alignment_tolerance_ms: 50
+    calibration_retry_limit: 5
+    holdover_max_ms: 3600000
+    holdover_max_error_ms: 1000
+    drift_bound_ppm: 100
+    monitor_interval_ms: 1000
+    external_change_threshold_ms: 200
+    fault_probe_interval_ms: 5000
+    synchronizing_timeout_ms: 30000
+    holdover_enabled: true
+
+  sources:
+    ntp:
+      enabled: true
+      servers:
+        - id: ntp0
+          host: pool.ntp.org
+          port: 123
+          priority: 10
+          timeout_ms: 3000
+          poll_interval_ms: 30000
+          queueing_budget_ms: 50
+          auth_mode: none              # nts/symmetric 为扩展点（拒绝）
+          drift_upper_ppm: 100
+    cellular:
+      enabled: true                    # 无蜂窝模块 → unsupported，不影响其他来源
+      priority: 30
+    gnss:
+      enabled: true                    # 无 GNSS 设备/协议契约 → unsupported（缺口登记）
+      priority: 20
+    rtc:
+      enabled: true                    # 仅后备；provision 证据接口缺口 → 默认不可用
+      priority: 40
+      require_provisioned: true
