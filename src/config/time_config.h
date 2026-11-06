@@ -17,6 +17,7 @@
 #include "sources/ntp_source.h"
 #include "sources/source_manager.h"
 #include "backends/linux_system_clock_backend.h"
+#include "backends/system_observer_backend.h"
 
 namespace tbox {
 namespace time {
@@ -38,6 +39,12 @@ struct TimeConfig {
     // 后端
     BackendKind backend_kind = BackendKind::kLinuxSystemClock;
     LinuxBackendConfig linux_backend;
+    SystemObserverConfig observer;   ///< backend.observer（system-observe，CR-002）
+
+    // 解析期显式出现键记录（CR-002）：system-observe 下显式写钟专属键拒绝，
+    // 避免默认值被误判（缺省值不得实例化 writer/校准逻辑，设计 §4.2）。
+    bool seen_write_specific_backend = false;  ///< allow_competing_writers / competing_processes
+    bool seen_write_specific_core = false;     ///< step/slew/alignment_tolerance/calibration_retry_limit
 
     // 校时/选源/保持核心配置
     TimeCoreConfig core;

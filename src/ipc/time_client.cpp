@@ -51,6 +51,11 @@ TimeReason parseReason(const std::string& r) {
     if (r == "backend_unsupported") return TimeReason::kBackendUnsupported;
     if (r == "competing_writer") return TimeReason::kCompetingWriter;
     if (r == "policy_violation") return TimeReason::kPolicyViolation;
+    if (r == "observed_synchronized") return TimeReason::kObservedSynchronized;
+    if (r == "observer_interface_unavailable")
+        return TimeReason::kObserverInterfaceUnavailable;
+    if (r == "observer_evidence_unavailable")
+        return TimeReason::kObserverEvidenceUnavailable;
     return TimeReason::kNone;
 }
 

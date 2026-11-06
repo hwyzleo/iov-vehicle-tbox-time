@@ -1,0 +1,24 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# tbox::time_client 静态链接 framework-ipc / framework-application（PUBLIC）。
+# 静态库的依赖在最终链接时需由消费方解析，故声明 find_dependency。
+# 调用方只面向 TIME 业务 facade（tbox/time/*.h），不直接使用 framework IPC
+# 类型或 socket（TBOX-TIME-DSN-CR-001 设计 §2/§6）。
+find_dependency(TboxFramework CONFIG)
+
+# nlohmann_json: tbox::time_client 内部使用（IPC JSON 载荷），公开头未引用，
+# 但静态库导出目标仍会在链接时引用其符号。
+find_dependency(nlohmann_json CONFIG)
+
+# yaml-cpp: 以 PRIVATE 链接进静态库 tbox-time-lib，CMake 因此在导出目标的
+# INTERFACE_LINK_LIBRARIES 中留下 $<LINK_ONLY:yaml-cpp::yaml-cpp>。静态库的
+# 依赖由消费方在最终链接时解析，故此处必须声明，否则仅消费已安装 SDK 的
+# 工程（integration/installed_consumer）会在 configure 阶段报
+# yaml-cpp::yaml-cpp 目标不存在。
+find_dependency(yaml-cpp CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/TboxTimeClientTargets.cmake")
+
+check_required_components(TboxTimeClient)

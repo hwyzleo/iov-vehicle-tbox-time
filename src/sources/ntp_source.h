@@ -11,6 +11,10 @@
 // 计龄使用 BOOTTIME 语义单调钟（含休眠经过时间）。
 //
 
+// <atomic> 必须显式包含：本头的成员使用 std::atomic<> 完整类型。
+// libstdc++ 的 <thread> 只经 <memory> 带入 atomic_base.h 的前向声明
+// （struct atomic;），不提供主模板定义，gcc-9 下会报 incomplete type。
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>

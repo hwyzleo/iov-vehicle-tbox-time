@@ -32,6 +32,11 @@ const char* timeReasonName(TimeReason r) noexcept {
         case TimeReason::kBackendUnsupported: return "backend_unsupported";
         case TimeReason::kCompetingWriter: return "competing_writer";
         case TimeReason::kPolicyViolation: return "policy_violation";
+        case TimeReason::kObservedSynchronized: return "observed_synchronized";
+        case TimeReason::kObserverInterfaceUnavailable:
+            return "observer_interface_unavailable";
+        case TimeReason::kObserverEvidenceUnavailable:
+            return "observer_evidence_unavailable";
     }
     return "unknown";
 }

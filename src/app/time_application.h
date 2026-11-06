@@ -17,6 +17,7 @@
 
 #include "backends/linux_system_clock_backend.h"
 #include "backends/mock_backend.h"
+#include "backends/system_observer_backend.h"
 #include "config/time_config.h"
 #include "core/time_core.h"
 #include "ipc/time_ipc_server.h"
@@ -47,6 +48,7 @@ private:
     std::unique_ptr<TimeCore> core_;
     std::unique_ptr<SourceManager> source_mgr_;
     std::vector<std::unique_ptr<NtpSourceAdapter>> ntp_adapters_;
+    std::unique_ptr<SystemObserverSource> observer_source_;  ///< system-observe（CR-002）
     std::unique_ptr<TimeIpcServer> ipc_;
     std::thread scheduler_thread_;
     std::atomic<bool> scheduler_running_{false};

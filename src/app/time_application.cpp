@@ -24,17 +24,48 @@ bool readFile(const std::string& path, std::string* out) {
     return true;
 }
 
+bool fileExists(const std::string& path) {
+    std::ifstream in(path);
+    return in.good();
+}
+
 }  // namespace
 
 TimeApplication::TimeApplication() = default;
 
 bool TimeApplication::loadConfig() {
-    // 配置根：默认 {"/etc/tbox/", "./config/"}（FW Application 约定）
+    // 配置根：默认 {"/etc/tbox/", "./config/"}（FW Application 约定）。
+    //
+    // 候选文件顺序与 framework PathResolver 的分层优先级保持一致
+    // （conf.d/<svc> < roots[i]/<svc>，见 framework src/config/path_resolver.h）：
+    // 根级 time.yaml 优先于 conf.d/time.yaml，首个命中即生效。
+    //   * conf.d/time.yaml        发布正式契约路径，BUILD release-managed
+    //                             （config-deployment: /etc/tbox/conf.d/*.yaml → replace），
+    //                             随 release-set 更新；
+    //   * time.yaml/tbox-time.yaml 设备本地覆盖与开发 bring-up 路径，BUILD 无部署
+    //                             规则（默认 preserve），不随发布更新。
+    static constexpr const char* kCandidates[] = {
+        "time.yaml",
+        "tbox-time.yaml",
+        "conf.d/time.yaml",
+    };
     for (const auto& root : getConfigRoots()) {
-        for (const auto& name : {"time.yaml", "tbox-time.yaml"}) {
+        const std::string managed = root + "conf.d/time.yaml";
+        for (const auto* name : kCandidates) {
             const std::string path = root + name;
             std::string text;
-            if (readFile(path, &text)) {
+            if (!readFile(path, &text)) continue;
+            // 设备本地文件遮蔽了 release-managed 配置：此时发布更新
+            // conf.d/time.yaml 不会生效，必须可诊断而非静默降级。
+            if (path != managed && fileExists(managed)) {
+                log().warn("config.shadowed",
+                           "device-local time config shadows the "
+                           "release-managed conf.d config; release updates to "
+                           "conf.d/time.yaml will not take effect",
+                           {{"path", tbox::fw::log::FieldValue::makeString(path)},
+                            {"shadowed", tbox::fw::log::FieldValue::makeString(managed)}});
+            }
+            {
                 std::string err;
                 if (!loadTimeConfig(text, &config_, &err)) {
                     log().error("config.load_failed", "config parse failed",
@@ -48,18 +79,23 @@ bool TimeApplication::loadConfig() {
             }
         }
     }
-    log().error("config.missing", "no time.yaml found in config roots");
+    log().error("config.missing",
+                "no time config found in config roots "
+                "(tried conf.d/time.yaml, time.yaml, tbox-time.yaml)");
     return false;
 }
 
 bool TimeApplication::initialize() {
     if (!loadConfig()) return false;
 
-    // ---- 后端（唯一写入方）----
+    // ---- 后端（system-observe：只读观测；linux：唯一写入方；mock：测试）----
     switch (config_.backend_kind) {
         case BackendKind::kLinuxSystemClock:
             backend_ = std::make_unique<LinuxSystemClockBackend>(
                 config_.linux_backend);
+            break;
+        case BackendKind::kSystemObserve:
+            backend_ = std::make_unique<SystemObserverBackend>();
             break;
         case BackendKind::kMock:
             backend_ = std::make_unique<MockBackend>(0);
@@ -68,6 +104,9 @@ bool TimeApplication::initialize() {
             log().error("backend.unsupported", "backend kind not available");
             return false;
     }
+    // 观测形态：TIME 是系统时钟同步状态的观测方与事实分发方，不写钟（CR-002）。
+    config_.core.observe_mode =
+        config_.backend_kind == BackendKind::kSystemObserve;
     backend_ready_ = backend_->capability() == BackendCapability::kReady;
     if (!backend_ready_) {
         log().warn("backend.unavailable",
@@ -114,11 +153,20 @@ bool TimeApplication::initialize() {
                      }())}});
     }
 
-    // NTP（本次实际落地来源）
+    // NTP（写钟形态：本次实际落地来源；观测形态下自采源被配置校验拒绝）
     for (const auto& ntp : config_.ntp_servers) {
         auto adapter = std::make_unique<NtpSourceAdapter>(ntp);
         core_->registerSource(adapter.get(), ntp.priority);
         ntp_adapters_.push_back(std::move(adapter));
+    }
+
+    // system-observe（CR-002）：timesyncd 观测来源（只读 adjtimex + D-Bus）。
+    // 非 Linux/无 libsystemd 平台 capability=Unsupported：daemon 仍正常启动，
+    // 明确报告时间不可用（不伪造观测）。
+    if (config_.backend_kind == BackendKind::kSystemObserve) {
+        auto obs = std::make_unique<SystemObserverSource>(config_.observer);
+        core_->registerSource(obs.get(), 10);
+        observer_source_ = std::move(obs);
     }
 
     // ---- IPC ----
@@ -143,6 +191,13 @@ bool TimeApplication::initialize() {
             [core = core_.get()](const SourceSample& s) { core->onSourceSample(s); },
             gen);
         a->start(std::move(cb));
+    }
+    if (observer_source_) {
+        auto gen = std::make_shared<std::atomic<uint32_t>>(0);
+        auto cb = SourceManager::wrapGeneration(
+            [core = core_.get()](const SourceSample& s) { core->onSourceSample(s); },
+            gen);
+        observer_source_->start(std::move(cb));
     }
 
     log().info("service.ready", "tbox-time service ready",
@@ -180,6 +235,8 @@ void TimeApplication::cleanup() {
 
     for (auto& a : ntp_adapters_) a->stop();
     ntp_adapters_.clear();
+    if (observer_source_) observer_source_->stop();
+    observer_source_.reset();
     source_mgr_->stopAll();
 
     ipc_->stop();

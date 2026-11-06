@@ -56,9 +56,47 @@ bool validateTimeConfig(const TimeConfig& cfg, std::string* error) {
     }
 
     // 后端
-    if (cfg.backend_kind == BackendKind::kChronyObserve) {
-        return fail("chrony observe backend is a registered extension point, "
-                    "not implemented (see docs/implementation_notes.md)");
+    if (cfg.backend_kind == BackendKind::kSystemObserve) {
+        // 观测 driver：当前唯一 timesyncd；其他值 unsupported 并拒绝，
+        // 不假装支持 chrony/ntpd（设计 §6）。
+        if (cfg.observer.driver != "timesyncd") {
+            return fail("backend.observer.driver must be 'timesyncd' (other "
+                        "drivers unsupported)");
+        }
+        if (cfg.observer.poll_interval_ms < 100 ||
+            cfg.observer.poll_interval_ms > 10000) {
+            return fail("backend.observer.poll_interval_ms must be in "
+                        "[100, 10000]");
+        }
+        if (cfg.observer.dbus_timeout_ms < 100 ||
+            cfg.observer.dbus_timeout_ms > 5000) {
+            return fail("backend.observer.dbus_timeout_ms must be in "
+                        "[100, 5000]");
+        }
+        // 显式写钟专属键：仅适用于 backend.mode=linux；缺省值不得实例化
+        // writer 检测或校准逻辑（设计 §4.2，避免默认 competing_processes 中的
+        // systemd-timesyncd 被误判）。
+        if (cfg.seen_write_specific_backend || cfg.seen_write_specific_core) {
+            return fail("write-specific keys (allow_competing_writers / "
+                        "competing_processes / step_threshold_ms / "
+                        "slew_threshold_ms / alignment_tolerance_ms / "
+                        "calibration_retry_limit) only apply to "
+                        "backend.mode=linux");
+        }
+        // 自采源独立候选在观测形态拒绝（设计 §2：未驱动系统钟的样本不能
+        // 证明系统钟对齐，Orin RTC 也无 SEC 合格证据）。
+        if (!cfg.ntp_servers.empty() || cfg.cellular.enabled ||
+            cfg.gnss.enabled || cfg.rtc.enabled) {
+            return fail("self-collected sources (ntp/cellular/gnss/rtc) are "
+                        "disabled in system-observe (system clock is the only "
+                        "candidate)");
+        }
+    }
+
+    // production：max_source_age_ms 不得大于 300000（设计 §6，SEC 300s 窗口）。
+    if (cfg.profile == RunProfile::kProduction &&
+        cfg.core.max_source_age_ms > 300000) {
+        return fail("core.max_source_age_ms must be <= 300000 in production");
     }
 
     // 核心范围
@@ -142,17 +180,49 @@ bool loadTimeConfig(const std::string& yaml_text, TimeConfig* out,
             const std::string m = backend["mode"].as<std::string>("");
             if (m == "linux") cfg.backend_kind = BackendKind::kLinuxSystemClock;
             else if (m == "mock") cfg.backend_kind = BackendKind::kMock;
-            else if (m == "chrony") cfg.backend_kind = BackendKind::kChronyObserve;
-            else return fail("backend.mode must be 'linux' | 'mock' | 'chrony'");
+            else if (m == "system-observe") cfg.backend_kind = BackendKind::kSystemObserve;
+            else if (m == "chrony") {
+                // CR-002：chrony 为已退役扩展点名（与 system-observe 同值别名），
+                // 配置不接受，给出迁移提示，不制造 chrony 已支持的错觉。
+                return fail("backend.mode 'chrony' is a retired extension-point "
+                            "name; use 'system-observe' (chrony behavior is not "
+                            "implemented, see docs/implementation_notes.md)");
+            } else {
+                return fail("backend.mode must be 'linux' | 'system-observe' | "
+                            "'mock'");
+            }
         }
         if (backend["allow_competing_writers"]) {
             if (!parseBool(backend["allow_competing_writers"],
                            &cfg.linux_backend.allow_competing_writers, error))
                 return fail("backend.allow_competing_writers " + *error);
+            cfg.seen_write_specific_backend = true;  // 写钟专属（CR-002）
         }
         if (backend["competing_processes"]) {
             cfg.linux_backend.competing_processes =
                 backend["competing_processes"].as<std::string>();
+            cfg.seen_write_specific_backend = true;  // 写钟专属（CR-002）
+        }
+        // --- backend.observer（system-observe，CR-002）---
+        if (backend["observer"]) {
+            const YAML::Node& obs = backend["observer"];
+            if (obs && obs.IsMap()) {
+                if (obs["driver"]) {
+                    cfg.observer.driver = obs["driver"].as<std::string>();
+                }
+                if (obs["poll_interval_ms"]) {
+                    int64_t v;
+                    if (!parseInt64(obs["poll_interval_ms"], &v, error))
+                        return fail("backend.observer.poll_interval_ms " + *error);
+                    cfg.observer.poll_interval_ms = v;
+                }
+                if (obs["dbus_timeout_ms"]) {
+                    int64_t v;
+                    if (!parseInt64(obs["dbus_timeout_ms"], &v, error))
+                        return fail("backend.observer.dbus_timeout_ms " + *error);
+                    cfg.observer.dbus_timeout_ms = v;
+                }
+            }
         }
     }
 
@@ -194,6 +264,11 @@ bool loadTimeConfig(const std::string& yaml_text, TimeConfig* out,
             return false;
         if (!set_i64("calibration_retry_limit", &cfg.core.calibration_retry_limit))
             return false;
+        // 写钟专属键显式出现记录（CR-002：system-observe 下拒绝）
+        for (const char* k : {"step_threshold_ms", "slew_threshold_ms",
+                              "alignment_tolerance_ms", "calibration_retry_limit"}) {
+            if (core[k]) cfg.seen_write_specific_core = true;
+        }
         if (!set_i64("holdover_max_ms", &cfg.core.holdover_max_ms)) return false;
         if (!set_i64("holdover_max_error_ms", &cfg.core.holdover_max_error_ms))
             return false;

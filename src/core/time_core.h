@@ -55,6 +55,9 @@ struct TimeCoreConfig {
     int64_t holdover_enter_min_age_ms = 120000; ///< 最短需保持时长才进入 HOLDOVER
     bool holdover_enabled = true;
     int64_t poll_interval_ms = 30000;        ///< 来源轮询间隔（调度层使用）
+    // system-observe（TBOX-TIME-DSN-CR-002）：只读 adjtimex + D-Bus timesync1 观测，
+    // 不写钟、不实例化 writer/校准逻辑（由应用层按 backend.mode 设置）。
+    bool observe_mode = false;
 };
 
 /// 时间核心。

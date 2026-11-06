@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <mutex>
 
+#include "backends/observer_math.h"
 #include "tbox/time/time_snapshot.h"
 
 namespace tbox {
@@ -19,6 +20,19 @@ int64_t holdoverUncertainty(int64_t base_uncertainty_ms, int64_t drift_ppm,
 }
 
 int64_t max64(int64_t a, int64_t b) { return a > b ? a : b; }
+
+// system-observe（CR-002）：从观测样本字段按设计 §5 公式计算
+// 当前真实测量年龄与保守不确定度（查询/判定时刻，随时间增长）。
+int64_t observeFreshnessFromSample(const SourceSample& s, int64_t now_boot_ms) {
+    return observerFreshnessMs(s.observed_age0_ms, s.observed_boot_ms,
+                               now_boot_ms);
+}
+int64_t observeUncertaintyFromSample(const SourceSample& s, int64_t now_boot_ms) {
+    return observerUncertaintyMs(s.observed_age0_ms, s.observed_boot_ms,
+                                 now_boot_ms, s.observed_kernel_maxerror_us,
+                                 s.observed_root_distance_us,
+                                 s.observed_kernel_tolerance_ppm);
+}
 
 }  // namespace
 
@@ -139,18 +153,37 @@ public:
             case TimeState::kSynced: {
                 if (sync_basis) {
                     const auto& s = *sync_basis;
-                    snap.utc_valid = s.utc_valid;
-                    snap.utc_epoch_ms = s.utc_epoch_ms;
-                    snap.uncertainty_valid = s.error_bounded;
-                    snap.uncertainty_ms = s.error_bounded ? s.error_upper_ms : 0;
-                    snap.drift_bound_ppm =
-                        s.drift_bounded ? s.drift_upper_ppm : cfg.drift_bound_ppm;
-                    snap.system_clock_aligned = true;
-                    snap.freshness_age_ms =
-                        has_verified_baseline ? now - last_verified_boot_ms
-                                              : 0;
-                    snap.remaining_validity_ms =
-                        max64(cfg.max_source_age_ms - snap.freshness_age_ms, 0);
+                    if (cfg.observe_mode && s.observed_sample) {
+                        // 观测形态：freshness/uncertainty 在回复生成时按设计 §5
+                        // 公式实时增长（真实测量年龄 + 保守误差上界）。
+                        const int64_t age = observeFreshnessFromSample(s, now);
+                        const int64_t u = observeUncertaintyFromSample(s, now);
+                        snap.utc_valid = s.utc_valid;
+                        snap.utc_epoch_ms = s.utc_epoch_ms;
+                        snap.uncertainty_valid = u >= 0;
+                        snap.uncertainty_ms = u >= 0 ? u : 0;
+                        snap.drift_bound_ppm =
+                            s.drift_bounded ? s.drift_upper_ppm
+                                            : cfg.drift_bound_ppm;
+                        snap.system_clock_aligned = true;
+                        snap.alignment_error_ms = s.observed_alignment_error_ms;
+                        snap.freshness_age_ms = age >= 0 ? age : 0;
+                        snap.remaining_validity_ms =
+                            max64(cfg.max_source_age_ms - (age >= 0 ? age : 0), 0);
+                    } else {
+                        snap.utc_valid = s.utc_valid;
+                        snap.utc_epoch_ms = s.utc_epoch_ms;
+                        snap.uncertainty_valid = s.error_bounded;
+                        snap.uncertainty_ms = s.error_bounded ? s.error_upper_ms : 0;
+                        snap.drift_bound_ppm =
+                            s.drift_bounded ? s.drift_upper_ppm : cfg.drift_bound_ppm;
+                        snap.system_clock_aligned = true;
+                        snap.freshness_age_ms =
+                            has_verified_baseline ? now - last_verified_boot_ms
+                                                  : 0;
+                        snap.remaining_validity_ms =
+                            max64(cfg.max_source_age_ms - snap.freshness_age_ms, 0);
+                    }
                 }
                 break;
             }
@@ -188,11 +221,18 @@ public:
         if (!s.last) return false;
         const auto& smp = *s.last;
         if (!smp.utc_valid || !smp.healthy) return false;
-        const int64_t age = now - smp.sampled_boot_ms;
+        int64_t age = now - smp.sampled_boot_ms;
+        int64_t err = smp.error_bounded ? smp.error_upper_ms : -1;
+        if (cfg.observe_mode && smp.observed_sample) {
+            // 观测形态：按真实测量年龄与当前保守不确定度判定（设计 §5）。
+            // STA_UNSYNC 置位（内核未纪律）→ 非合格候选（对齐未满足）。
+            age = observeFreshnessFromSample(smp, now);
+            if (age < 0) return false;
+            if (smp.observed_sta_unsync) return false;
+            err = observeUncertaintyFromSample(smp, now);
+        }
         if (smp.age_valid && age > cfg.max_source_age_ms) return false;
-        if (smp.error_bounded && smp.error_upper_ms > cfg.max_source_error_ms)
-            return false;
-        if (!smp.error_bounded) return false;  // 无法界定时拒绝可用声明
+        if (err < 0 || err > cfg.max_source_error_ms) return false;
         if (smp.auth_status == AuthStatus::kFailed) return false;  // 证据验证失败不可用
         if (cfg.require_authenticated_sources &&
             smp.auth_status != AuthStatus::kVerified)
@@ -238,7 +278,10 @@ public:
                 return;
             }
             if (st == TimeState::kSyncing) {
-                commitLocked(TimeState::kUnsynch, TimeReason::kSourceLost,
+                commitLocked(TimeState::kUnsynch,
+                             cfg.observe_mode
+                                 ? TimeReason::kObserverEvidenceUnavailable
+                                 : TimeReason::kSourceLost,
                              "sync target lost", nullptr, 0, false);
                 return;
             }
@@ -250,10 +293,6 @@ public:
                 const bool stable =
                     best->stable_count >= cfg.stability_window_syncs &&
                     (now - best->stable_since_boot_ms) >= cfg.switch_hysteresis_ms;
-                fprintf(stderr, "DBG2 best=%s active=%s stable=%d/%d dur=%lld hyst=%lld ok=%d\n",
-                        best->adapter->sourceId().c_str(), active->adapter->sourceId().c_str(),
-                        best->stable_count, cfg.stability_window_syncs,
-                        (long long)(now - best->stable_since_boot_ms), (long long)cfg.switch_hysteresis_ms);
                 if (stable) {
                     commitLocked(TimeState::kSyncing, TimeReason::kSourceChanged,
                                  "switched to higher priority source",
@@ -391,6 +430,37 @@ public:
                      "alignment verified", &smp, alignment, false);
     }
 
+    // 观测形态状态推进（system-observe，设计 §4.1）：无任何写钟调用。
+    // kSyncing 仅表示证据获取/稳定窗口/首次质量校验尚未完成；观测模式
+    // 没有“我写成功了”事件，不读回验证，不使用 kAlignmentVerified。
+    void observeCheckLocked(int64_t now) {
+        if (snap.state != TimeState::kSyncing) return;
+        PerSource* target = findSource(snap.source_id);
+        if (!target || !target->last || !candidateOkLocked(*target, now)) return;
+        const SourceSample& smp = *target->last;
+
+        if (now - sync_start_boot_ms > cfg.synchronizing_timeout_ms) {
+            commitLocked(TimeState::kUnsynch, TimeReason::kNoSourceAvailable,
+                         "synchronizing timeout (observe)", nullptr, 0, false);
+            return;
+        }
+        // 稳定窗口：连续合格观测（同 source_epoch）满足后才宣告同步（设计 §4.1）。
+        if (target->stable_count < cfg.stability_window_syncs) return;
+
+        // 观测同步建立：STA_UNSYNC clear + 完整 NTP 证据 + freshness/uncertainty
+        // 达标（candidateOkLocked 已校验）→ kSynced（kObservedSynchronized）。
+        ClockRead wall = backend->readClock();
+        last_verified_wall_ms =
+            wall.valid ? wall.realtime_epoch_ms : smp.utc_epoch_ms;
+        last_verified_boot_ms = now;
+        has_verified_baseline = wall.valid;
+        sync_basis = smp;
+        commitLocked(TimeState::kSynced, TimeReason::kObservedSynchronized,
+                     "observed synchronized (STA_UNSYNC clear, evidence within "
+                     "thresholds)",
+                     &smp, smp.observed_alignment_error_ms, false);
+    }
+
     void monitorLocked(int64_t now) {
         const TimeState st = snap.state;
         if (st != TimeState::kSynced && st != TimeState::kHoldover) return;
@@ -407,6 +477,25 @@ public:
             const int64_t dev = wall.realtime_epoch_ms - expected;
             if (dev > cfg.external_change_threshold_ms + drift_budget ||
                 dev < -(cfg.external_change_threshold_ms + drift_budget)) {
+                if (cfg.observe_mode) {
+                    // 外部改时/回拨（含 timesyncd 自身 step）：立即使旧样本和锚点
+                    // 失效，先进入 kSyncing 等待新外部测量证据；无新证据则下一 tick
+                    // 转 kUnsynch（设计 §4.1）。TIME 不执行反向修正。
+                    PerSource* active = nullptr;
+                    if (!snap.source_id.empty()) {
+                        active = findSource(snap.source_id);
+                    }
+                    if (active) {
+                        active->last.reset();
+                        active->stable_count = 0;
+                    }
+                    commitLocked(TimeState::kSyncing,
+                                 TimeReason::kRollbackDetected,
+                                 "external clock change detected, awaiting new "
+                                 "observation",
+                                 nullptr, 0, false);
+                    return;
+                }
                 commitLocked(TimeState::kUnsynch, TimeReason::kRollbackDetected,
                              "external clock change detected", nullptr, 0, false);
                 return;
@@ -440,6 +529,9 @@ public:
 
     void probeFaultLocked(int64_t now) {
         if (snap.state != TimeState::kFault) return;
+        // 观测形态的 FAULT 由观测接口故障样本驱动，恢复由新的合格观测样本
+        // 驱动（onSourceSampleLocked）；不按后端能力探测（后端只读、恒 Ready）。
+        if (cfg.observe_mode) return;
         if (now - last_fault_probe_boot_ms < cfg.fault_probe_interval_ms) return;
         last_fault_probe_boot_ms = now;
         const BackendCapability cap = backend->capability();
@@ -455,7 +547,11 @@ public:
         if (!running) return;
         probeFaultLocked(now);
         reevaluateLocked(now);
-        calibrateLocked(now);
+        if (cfg.observe_mode) {
+            observeCheckLocked(now);
+        } else {
+            calibrateLocked(now);
+        }
         monitorLocked(now);
     }
 
@@ -472,6 +568,20 @@ public:
         }
         s->generation = sample.adapter_generation;
 
+        // 观测接口故障（adjtimex 失败/缺 interface/属性类型错误/非法契约）：
+        // 立即进入 FAULT（设计 §4.1）；恢复由新的合格观测样本驱动，先 kSyncing。
+        if (cfg.observe_mode && sample.observed_sample &&
+            sample.health == SourceHealth::kObserverInterfaceUnavailable) {
+            s->last.reset();
+            s->stable_count = 0;
+            commitLocked(TimeState::kFault, TimeReason::kObserverInterfaceUnavailable,
+                         sample.health_detail.empty()
+                             ? "observer interface unavailable"
+                             : sample.health_detail,
+                         nullptr, 0, false);
+            return;
+        }
+
         if (!sample.healthy || !sample.utc_valid) {
             // 来源失效：立即撤销有效状态（设计 §3：当前来源失效不受稳定窗口阻碍）
             s->last.reset();
@@ -479,15 +589,32 @@ public:
             reevaluateLocked(now);
             return;
         }
-        const int64_t age = now - sample.sampled_boot_ms;
+
+        // 观测接口恢复：FAULT 消除 → 先撤销故障，再按既有路径重新获取与校验。
+        if (cfg.observe_mode && snap.state == TimeState::kFault) {
+            commitLocked(TimeState::kUnsynch, TimeReason::kInitial,
+                         "observer interface recovered", nullptr, 0, false);
+        }
+
+        int64_t age = now - sample.sampled_boot_ms;
+        if (cfg.observe_mode && sample.observed_sample) {
+            // 观测形态按真实测量年龄判定（设计 §5.2）。
+            age = observeFreshnessFromSample(sample, now);
+            if (sample.observed_sta_unsync) {
+                // 内核未纪律：非合格候选（不计入稳定窗口），保留结构有效样本。
+                s->stable_count = 0;
+            }
+        }
         if (sample.age_valid && age > cfg.max_source_age_ms) {
             s->last.reset();
             s->stable_count = 0;
             return;
         }
-        // 运行期新样本偏差大于 step 阈值或发生回拨：先原子撤销同步并发出
-        // 变化事件，再执行受控重同步（设计 §4.3）。不得静默跳变。
-        if (snap.state == TimeState::kSynced && sample.source_id == snap.source_id) {
+        // 运行期新样本偏差撤销检测仅用于写钟形态；观测形态不写钟，外部改时
+        // 由 monitorLocked 的墙钟/BOOTTIME 基准检测（设计 §4.1/§10，timesyncd
+        // 自身 step 同样适用，TIME 不执行反向修正）。
+        if (!cfg.observe_mode && snap.state == TimeState::kSynced &&
+            sample.source_id == snap.source_id) {
             const ClockRead wall = backend->readClock();
             if (wall.valid) {
                 const int64_t dev = sample.utc_epoch_ms - wall.realtime_epoch_ms;

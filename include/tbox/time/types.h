@@ -48,6 +48,10 @@ enum class TimeReason : uint8_t {
     kBackendUnsupported = 13,///< 后端不支持（平台缺失）
     kCompetingWriter = 14,   ///< 检测到竞争校时写入者
     kPolicyViolation = 15,   ///< 超策略门限（年龄/误差/漂移）
+    // ---- system-observe（TBOX-TIME-DSN-CR-002）：append-only 追加，旧值不变 ----
+    kObservedSynchronized = 16,      ///< 观测形态：观测事实满足（STA_UNSYNC clear + 完整证据 + 门限达标）
+    kObserverInterfaceUnavailable = 17, ///< 观测接口故障（adjtimex 失败/缺 interface/契约非法）
+    kObserverEvidenceUnavailable = 18,  ///< 观测证据不可用（D-Bus absent/报文缺失/STA_UNSYNC set）
 };
 
 /// 认证证据状态（设计 §3/§5；TIME 不输出 security_trusted=true）。
@@ -78,9 +82,13 @@ enum class SourceCapability : uint8_t {
 /// 校时后端类型。
 enum class BackendKind : uint8_t {
     kLinuxSystemClock = 1, ///< 自研 Linux 校时后端（唯一写入方）
-    kChronyObserve = 2,    ///< 复用 chrony 观测模式（扩展点，未实现）
+    kSystemObserve = 2,    ///< 系统观测后端：只读 adjtimex + D-Bus timesync1（不写钟）
     kMock = 3,             ///< 测试后端（仅测试 profile，production 拒绝）
     kUnsupported = 4,      ///< 当前平台无可用后端
+    /// 废弃源码别名（TBOX-TIME-DSN-CR-002）：CR-001 登记的 chrony 观测
+    /// 扩展点与 system-observe 同值。保留别名避免无意义破坏；配置层不接受
+    /// "chrony"（给出迁移提示改用 system-observe，不制造 chrony 已支持的错觉）。
+    kChronyObserve = kSystemObserve,
 };
 
 /// 状态 → 派生 synchronized。synchronized 只能由状态推导，不独立维护（REQ-003）。

@@ -1,9 +1,26 @@
 # TBOX-TIME 示例配置。
 #
-# production：真实 NTP（Wi-Fi/以太网承载）+ Linux 系统时钟后端（唯一写入方）。
+# 两种后端形态（TBOX-TIME-DSN-CR-002，互斥启用，同一实例只启用一种）：
+#   - system-observe（Orin 目标形态）：只读观测 systemd-timesyncd（D-Bus
+#     org.freedesktop.timesync1）+ adjtimex(modes=0)，TIME 不写钟、不需要
+#     CAP_SYS_TIME；自采源（ntp/cellular/gnss/rtc）独立候选禁用。
+#   - linux（通用默认，无系统同步守护进程的平台）：自研 RFC 5905 NTP + 唯一
+#     写入方（clock_settime step / adjtimex(ADJ_OFFSET) slew / 读回验证）。
 # 测试/本地开发：profile: test + backend.mode: mock + NTP 指向本地 mock 服务器。
 #
 # 完整 schema 与默认值：docs/config_schema.md。
+
+# ---- system-observe 形态示例（Orin overlay 由 BUILD 提供，本文件默认 linux）----
+#  backend:
+#    mode: system-observe
+#    observer:
+#      driver: timesyncd          # 当前唯一 driver
+#      poll_interval_ms: 1000     # [100,10000]，只决定观测频率
+#      dbus_timeout_ms: 1000      # [100,5000]，超时按证据不可用分类
+#  system-observe 下显式写钟专属键（allow_competing_writers/competing_processes/
+#  step_threshold_ms/slew_threshold_ms/alignment_tolerance_ms/calibration_retry_limit）
+#  一律拒绝；sources.ntp/cellular/gnss/rtc 必须全部 enabled: false。
+#  chrony 为已退役扩展点名：配置拒绝并提示改用 system-observe。
 
 time:
   profile: production
@@ -13,8 +30,8 @@ time:
     event_queue_limit: 1024
 
   backend:
-    mode: linux            # linux | mock(仅 test) | chrony(扩展点,拒绝)
-    allow_competing_writers: false   # 检测到 chronyd/ntpd 等 → FAULT（唯一写入方）
+    mode: linux            # linux | system-observe | mock(仅 test)；chrony 已退役拒绝
+    allow_competing_writers: false   # 检测到 chronyd/ntpd 等 → FAULT（唯一写入方；仅 linux 适用）
 
   core:
     max_source_age_ms: 300000

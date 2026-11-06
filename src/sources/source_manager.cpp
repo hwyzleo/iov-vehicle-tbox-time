@@ -1,6 +1,7 @@
 #include "sources/source_manager.h"
 
 #include <atomic>
+#include <cstring>
 #include <thread>
 
 #include "core/time_core.h"
@@ -9,6 +10,8 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/rtc.h>
+#include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -62,16 +65,29 @@ SourceCapability detectGnssModule(std::string* detail) {
 #endif
 }
 
-SourceCapability detectRtcModule(std::string* detail) {
+// RTC 设备默认路径集中在此，避免「探测用一个路径、读取用另一个路径」的漂移。
+//
+// 必须用 /dev/rtc（内核指定的系统 RTC 符号链接）而不是 /dev/rtc0：Orin Nano
+// 上存在两个 RTC —— rtc0 = nvvrs-pseq-rtc（PMIC 电源时序计数器，hctosys=0，
+// 实测读出 1970-01-01）、rtc1 = tegra_rtc（真实 RTC，hctosys=1，内核用它初始化
+// 系统钟），/dev/rtc -> rtc1。写死 rtc0 会把 1970 当作合法 UTC 样本喂进选源。
+const char* kDefaultRtcDevice = "/dev/rtc";
+
+std::string rtcDevicePath(const std::string& configured) {
+    return configured.empty() ? std::string(kDefaultRtcDevice) : configured;
+}
+
+SourceCapability detectRtcModule(std::string* detail, const std::string& device) {
 #if defined(__linux__)
-    const char* path = "/dev/rtc0";
-    if (access(path, F_OK) == 0) {
-        if (detail) *detail = "rtc node: /dev/rtc0";
+    const std::string path = rtcDevicePath(device);
+    if (access(path.c_str(), F_OK) == 0) {
+        if (detail) *detail = "rtc node: " + path;
         return SourceCapability::kAvailable;
     }
-    if (detail) *detail = "no /dev/rtc0";
+    if (detail) *detail = "no rtc node at " + path;
     return SourceCapability::kUnsupported;
 #else
+    (void)device;
     if (detail) *detail = "non-Linux platform: rtc unsupported";
     return SourceCapability::kUnsupported;
 #endif
@@ -152,7 +168,7 @@ SourceCapability GnssSourceAdapter::capability() const { return cap_; }
 RtcSourceAdapter::RtcSourceAdapter(RtcSourceConfig cfg)
     : cfg_(std::move(cfg)), cap_(SourceCapability::kDisabled) {
     std::string det;
-    const SourceCapability c = detectRtcModule(&det);
+    const SourceCapability c = detectRtcModule(&det, cfg_.device);
     if (!cfg_.enabled) {
         cap_ = SourceCapability::kDisabled;
     } else if (c == SourceCapability::kAvailable) {
@@ -192,7 +208,8 @@ void RtcSourceAdapter::pollLoop() {
     // 为平台契约（登记缺口）：require_provisioned=true 时无证据 → 不可用。
     // 首次实施：基础读取 + 配置 gate；无 provision 证据默认拒绝作为后备源。
 #if defined(__linux__)
-    const char* dev = cfg_.device.empty() ? "/dev/rtc0" : cfg_.device.c_str();
+    const std::string dev_path = rtcDevicePath(cfg_.device);
+    const char* dev = dev_path.c_str();
     int64_t next_poll = 0;
     bool first = true;
     while (running_.load()) {
@@ -224,9 +241,11 @@ void RtcSourceAdapter::pollLoop() {
                         t.tm_hour = tm.tm_hour;
                         t.tm_min = tm.tm_min;
                         t.tm_sec = tm.tm_sec;
-                        const time_t unix = timegm(&t);
+                        // 变量名避开 unix：GCC 在 GNU 方言（-std=gnu++17）下
+                        // 预定义 unix 宏（展开为 1），同名变量会解析失败。
+                        const time_t unix_secs = timegm(&t);
                         sample.utc_valid = true;
-                        sample.utc_epoch_ms = static_cast<int64_t>(unix) * 1000;
+                        sample.utc_epoch_ms = static_cast<int64_t>(unix_secs) * 1000;
                         sample.age_valid = true;
                         sample.sampled_boot_ms = now;
                         sample.error_bounded = true;

@@ -27,6 +27,7 @@
 #include "ipc.h"
 
 #include "backends/mock_backend.h"
+#include "backends/system_observer_backend.h"
 #include "core/time_core.h"
 #include "ipc/time_ipc_server.h"
 #include "sources/ntp_source.h"
@@ -297,6 +298,8 @@ TEST_F(E2eFixture, StateEventsDeliveredOverIpc) {
     ASSERT_NE(handle, nullptr);
 
     // 等待首次同步事件
+
+    // 等待首次同步事件
     bool saw_first_sync = false;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -352,6 +355,64 @@ TEST_F(E2eFixture, ConcurrentReadOnlyConsumers) {
     }
     for (auto& t : threads) t.join();
     EXPECT_GE(ok_count.load(), 20);  // 多数查询成功（期间可能短暂 HOLDOVER）
+}
+
+// CR-002：system-observe 观测形态启动路径。
+// HOST（非 Linux/无 libsystemd）上观测后端与来源如实标记 Unsupported（不占位）；
+// daemon（只读后端 + 核心 + IPC）仍正常启动：无源 → UNSYNCHRONIZED、IPC 明确不可用。
+TEST_F(E2eFixture, SystemObserveBootsUnavailableOnHost) {
+    // 只读观测后端：不写钟、竞争检测恒 false（timesyncd 是合法且预期的写入方）。
+    SystemObserverBackend obs_backend;
+#if !defined(__linux__)
+    EXPECT_EQ(obs_backend.capability(), BackendCapability::kUnsupported);
+#endif
+    const BackendResult st = obs_backend.stepTo(1'700'000'000'000);
+    EXPECT_FALSE(st.ok);
+    EXPECT_NE(st.detail.find("read-only"), std::string::npos);
+    const BackendResult sl = obs_backend.slewBy(10);
+    EXPECT_FALSE(sl.ok);
+    int64_t align = 0;
+    const BackendResult va = obs_backend.verifyAlignment(1'700'000'000'000, 100, &align);
+    EXPECT_FALSE(va.ok);
+    std::string detail;
+    EXPECT_FALSE(obs_backend.detectCompetingWriters(&detail));
+    EXPECT_NE(detail.find("systemd-timesyncd"), std::string::npos);
+
+    // 观测来源：HOST 无 libsystemd → Unsupported，不启动（无模块不阻塞启动）。
+    SystemObserverSource obs_source(SystemObserverConfig{});
+#if !defined(__linux__)
+    EXPECT_EQ(obs_source.capability(), SourceCapability::kUnsupported);
+    SampleCallback dead_cb = [](const SourceSample&) {};
+    EXPECT_FALSE(obs_source.start(std::move(dead_cb)));
+#endif
+
+    // 观测形态 daemon 装配：只读后端 + 无来源 → 明确不可用但本地 IPC 可查询。
+    TimeCoreConfig ocfg;
+    ocfg.observe_mode = true;
+    auto backend = std::make_unique<SystemObserverBackend>();
+    auto core = std::make_unique<TimeCore>(backend.get(), ocfg, &monotonicMs);
+    const std::string sock =
+        "/tmp/tbox-time-obs-e2e-" + std::to_string(getpid()) + ".sock";
+    auto server = std::make_unique<TimeIpcServer>(sock, 64);
+    core->setStateChangedCallback([server = server.get()](const TimeStateEvent& ev) {
+        server->enqueueEvent(ev);
+    });
+    ASSERT_TRUE(server->start(core.get()));
+    core->start();
+    core->tick();
+
+    TimeClient client(sock);
+    ASSERT_TRUE(client.connect());
+    const SnapshotResult res = client.getTimeSnapshot();
+    EXPECT_EQ(res.error, ClientError::kTimeUnavailable);
+    EXPECT_FALSE(res.snapshot.synchronized);
+    EXPECT_FALSE(res.snapshot.utc_valid);
+    EXPECT_FALSE(res.snapshot.uncertainty_valid);
+    EXPECT_TRUE(res.snapshot.validate());
+
+    core->stop();
+    server->stop();
+    std::remove(sock.c_str());
 }
 
 }  // namespace time

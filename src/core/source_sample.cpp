@@ -24,6 +24,15 @@ bool SourceSample::validate() const noexcept {
     if (drift_bounded && (drift_upper_ppm < 0 || drift_upper_ppm > 1000000)) {
         return false;
     }
+    if (observed_sample) {
+        if (observed_age0_ms < 0 || observed_boot_ms < 0 ||
+            observed_kernel_maxerror_us < 0 || observed_root_distance_us < 0 ||
+            observed_kernel_tolerance_ppm < 0 ||
+            observed_kernel_tolerance_ppm > 1000000 ||
+            observed_alignment_error_ms < 0) {
+            return false;
+        }
+    }
     // healthy 由构造方（适配器）按 health 设置；此处不覆盖。
     return true;
 }

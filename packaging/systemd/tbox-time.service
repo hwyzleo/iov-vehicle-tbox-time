@@ -1,0 +1,42 @@
+[Unit]
+Description=TBOX Time Service
+# NTP 来源需要网络承载（Wi-Fi/以太网）；无网时 TIME 仍可诊断运行并明确
+# 报告来源不可用，故用 Wants= 而非 Requires=。
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tbox_time
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# 写系统时钟的能力：TBOX-TIME-DSN-CR-002 起，目标 Orin 形态为 system-observe
+# （只读观测 systemd-timesyncd + adjtimex(modes=0)），TIME 不写钟、不要求
+# CAP_SYS_TIME，故 CapabilityBoundingSet/AmbientCapabilities 不再授予该能力。
+# Linux 写钟后备形态（无系统同步守护进程的平台）在无 CAP_SYS_TIME 时按既有
+# 权限故障路径 fail-closed（不置同步），不降级为占位实现。
+#
+# ProtectClock=false 保持：ProtectClock=true 需先在 Orin 实测证明 systemd 245
+# 的 seccomp 策略仍允许 adjtimex(modes=0) 只读查询（AT-15，B 级）。若实测被
+# 拦截则保留 false 并记录残余风险，不得为勾选加固项使观测失效。
+# systemd >= 245 支持该指令。
+ProtectClock=false
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 不启用 PrivateTmp：TIME 是 IPC 服务端，创建 /tmp/tbox-time.sock 供 SEC 等
+# 消费方连接（SEC 侧 sec.trusted_time.platform.time_client.socket_path 默认
+# 即此路径）。PrivateTmp 会为本 unit 挂载私有 /tmp，使该 socket 对 SEC 不可见。
+ReadWritePaths=/var/tbox /var/log/tbox /tmp
+# 不启用 PrivateDevices：RTC 后备来源经 ioctl(RTC_RD_TIME) 读 /dev/rtc*，
+# PrivateDevices 会以最小 /dev 替换，RTC 来源将恒为不可用。
+
+# Resource limits
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,7 @@
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
@@ -15,6 +16,24 @@ namespace tbox {
 namespace time {
 
 namespace {
+
+#if defined(__linux__)
+// /proc/<pid>/comm 受内核 TASK_COMM_LEN 限制：最长 15 字符 + NUL。
+// 配置里的 "systemd-timesyncd" 是 17 字符，在 comm 里只会是 "systemd-timesyn"，
+// 直接 strcmp 全名永远不相等 —— 竞争写入者被漏检，TIME 会误判自己是唯一写入方，
+// 与 systemd-timesyncd 同时写系统钟（比直接 FAULT 更糟，单写入方保证被静默破坏）。
+// 实测（Orin Nano / L4T R35.3.1）：pid=329 comm=[systemd-timesyn] 长度=15。
+constexpr size_t kCommMaxLen = 15;  // TASK_COMM_LEN - 1
+
+bool commMatches(const char* comm, const std::string& name) {
+    if (name.size() <= kCommMaxLen) {
+        return std::strcmp(comm, name.c_str()) == 0;
+    }
+    // 配置名超长：comm 必然是其前 15 字符的完整截断，按截断比较。
+    return std::strncmp(comm, name.c_str(), kCommMaxLen) == 0 &&
+           comm[kCommMaxLen] == '\0';
+}
+#endif
 
 int64_t realtimeMs() {
 #if defined(__linux__)
@@ -184,7 +203,7 @@ bool LinuxSystemClockBackend::detectCompetingLocked(std::string* detail) const {
                     buf[m] = '\0';
                     buf[m - 1] = '\0';  // 去掉换行
                     for (const auto& nm : names) {
-                        if (std::strcmp(buf, nm.c_str()) == 0) {
+                        if (commMatches(buf, nm)) {
                             found = true;
                             found_name = nm;
                             break;
@@ -197,7 +216,7 @@ bool LinuxSystemClockBackend::detectCompetingLocked(std::string* detail) const {
         }
         buf[n] = '\0';
         for (const auto& nm : names) {
-            if (std::strcmp(buf, nm.c_str()) == 0) {
+            if (commMatches(buf, nm)) {
                 found = true;
                 found_name = nm;
                 break;

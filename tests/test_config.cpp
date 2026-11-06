@@ -96,7 +96,7 @@ time:
     EXPECT_EQ(cfg.backend_kind, BackendKind::kMock);
 }
 
-// chrony 复用为登记扩展点：拒绝（未实现，不占位标完成）。
+// chrony 复用为登记扩展点：拒绝并给出迁移提示（CR-002：改用 system-observe）。
 TEST(Config, RejectsChronyExtensionPoint) {
     const std::string yaml = R"(
 time:
@@ -107,6 +107,7 @@ time:
     std::string err;
     EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
     EXPECT_NE(err.find("chrony"), std::string::npos);
+    EXPECT_NE(err.find("system-observe"), std::string::npos);  // 迁移提示
 }
 
 // 范围校验：非法阈值拒绝。
@@ -171,6 +172,155 @@ TEST(Config, ValidateDirectRejects) {
     cfg.backend_kind = BackendKind::kMock;  // production + mock
     std::string err;
     EXPECT_FALSE(validateTimeConfig(cfg, &err));
+}
+
+// ---- CR-002：system-observe 配置校验 ----
+
+// 合法观测配置：backend.mode=system-observe + observer 段，自采源全部禁用。
+TEST(Config, LoadValidSystemObserve) {
+    const std::string yaml = R"(
+time:
+  profile: production
+  backend:
+    mode: system-observe
+    observer:
+      driver: timesyncd
+      poll_interval_ms: 1000
+      dbus_timeout_ms: 1000
+  core:
+    max_source_age_ms: 300000
+    max_source_error_ms: 500
+  sources:
+    ntp: {enabled: false}
+    cellular: {enabled: false}
+    gnss: {enabled: false}
+    rtc: {enabled: false}
+)";
+    TimeConfig cfg;
+    std::string err;
+    ASSERT_TRUE(loadTimeConfig(yaml, &cfg, &err)) << err;
+    EXPECT_EQ(cfg.backend_kind, BackendKind::kSystemObserve);
+    EXPECT_EQ(cfg.observer.driver, "timesyncd");
+    EXPECT_EQ(cfg.observer.poll_interval_ms, 1000);
+    EXPECT_EQ(cfg.observer.dbus_timeout_ms, 1000);
+}
+
+// system-observe 下显式写钟专属键拒绝（设计 §4.2：仅适用于 backend.mode=linux）。
+TEST(Config, SystemObserveRejectsWriteSpecificCoreKeys) {
+    const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+  core:
+    step_threshold_ms: 1000
+)";
+    TimeConfig cfg;
+    std::string err;
+    EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+    EXPECT_NE(err.find("backend.mode=linux"), std::string::npos);
+}
+
+// system-observe 下显式 allow_competing_writers 拒绝（避免默认 competing_processes
+// 中的 systemd-timesyncd 被误判为竞争写入者）。
+TEST(Config, SystemObserveRejectsWriteSpecificBackendKeys) {
+    const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+    allow_competing_writers: true
+)";
+    TimeConfig cfg;
+    std::string err;
+    EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+    EXPECT_NE(err.find("backend.mode=linux"), std::string::npos);
+}
+
+// system-observe 下启用自采源独立候选拒绝（设计 §2：未驱动系统钟的样本不能证明对齐）。
+TEST(Config, SystemObserveRejectsSelfCollectedSources) {
+    const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+  sources:
+    ntp:
+      enabled: true
+      servers:
+        - id: ntp0
+          host: pool.ntp.org
+)";
+    TimeConfig cfg;
+    std::string err;
+    EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+    EXPECT_NE(err.find("system-observe"), std::string::npos);
+}
+
+// 观测 driver：仅 timesyncd；其他值 unsupported 并拒绝。
+TEST(Config, SystemObserveRejectsUnknownDriver) {
+    const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+    observer:
+      driver: chronyd
+)";
+    TimeConfig cfg;
+    std::string err;
+    EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+    EXPECT_NE(err.find("timesyncd"), std::string::npos);
+}
+
+// 观测轮询/超时范围校验。
+TEST(Config, SystemObserveRejectsOutOfRange) {
+    {
+        const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+    observer:
+      poll_interval_ms: 50
+)";
+        TimeConfig cfg;
+        std::string err;
+        EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+        EXPECT_NE(err.find("poll_interval_ms"), std::string::npos);
+    }
+    {
+        const std::string yaml = R"(
+time:
+  backend:
+    mode: system-observe
+    observer:
+      dbus_timeout_ms: 9000
+)";
+        TimeConfig cfg;
+        std::string err;
+        EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+        EXPECT_NE(err.find("dbus_timeout_ms"), std::string::npos);
+    }
+}
+
+// production：max_source_age_ms 不得大于 300000（SEC 300s 窗口，设计 §6）。
+TEST(Config, ProductionRejectsMaxSourceAgeAbove300s) {
+    const std::string yaml = R"(
+time:
+  profile: production
+  core:
+    max_source_age_ms: 301000
+)";
+    TimeConfig cfg;
+    std::string err;
+    EXPECT_FALSE(loadTimeConfig(yaml, &cfg, &err));
+    EXPECT_NE(err.find("max_source_age_ms"), std::string::npos);
+}
+
+// BackendKind 废弃别名：kChronyObserve == kSystemObserve（同值，不新增行为）。
+TEST(Config, ChronyObserveAliasEqualsSystemObserve) {
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::kChronyObserve),
+              static_cast<uint8_t>(BackendKind::kSystemObserve));
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::kSystemObserve), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::kLinuxSystemClock), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::kMock), 3u);
+    EXPECT_EQ(static_cast<uint8_t>(BackendKind::kUnsupported), 4u);
 }
 
 }  // namespace time

@@ -29,6 +29,7 @@ enum class SourceHealth : uint8_t {
     kAuthFailed = 6,      ///< 认证证据验证失败
     kInterfaceMissing = 7,///< 硬件/接口缺失（unsupported）
     kFault = 8,           ///< 其他故障
+    kObserverInterfaceUnavailable = 9, ///< 观测接口故障（adjtimex 失败/缺 interface/契约非法，CR-002）
 };
 
 /// 来源采样结果（设计 §3 SourceSample）。
@@ -57,6 +58,18 @@ struct SourceSample {
     bool healthy = false;           ///< 来源有效性
     SourceHealth health = SourceHealth::kOk;
     std::string health_detail;      ///< 诊断细节（脱敏）
+
+    // ---- system-observe 观测事实（TBOX-TIME-DSN-CR-002，设计 §3.2/§5）----
+    // 仅系统观测样本（source_id=system-timesyncd）填充，用于查询时按真实测量
+    // 年龄与保守不确定度公式实时计算增长；其余来源不设置（保持既有行为）。
+    bool observed_sample = false;        ///< 系统观测样本标记
+    bool observed_sta_unsync = false;    ///< 边界 STA_UNSYNC 置位（内核未纪律 → 非合格候选）
+    int64_t observed_age0_ms = 0;        ///< 首次观测该测量的已有年龄 age0 = R0 - D（D=DestinationTimestamp）
+    int64_t observed_boot_ms = 0;        ///< 观测边界 CLOCK_BOOTTIME B0
+    int64_t observed_kernel_maxerror_us = 0; ///< 边界 adjtimex.maxerror
+    int64_t observed_root_distance_us = 0;   ///< 边界根距离 RootDelay/2+RootDispersion+Jitter
+    int64_t observed_kernel_tolerance_ppm = 0; ///< 边界 adjtimex.tolerance 换算（有符号/溢出检查后）
+    int64_t observed_alignment_error_ms = 0;   ///< ceil(abs(adjtimex.offset)/1000)（观测偏差，非读回验证）
 
     /// 校验数值范围/溢出。非法返回 false（健康失败样本仍可通过结构校验）。
     bool validate() const noexcept;

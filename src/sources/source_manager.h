@@ -60,7 +60,7 @@ struct RtcSourceConfig {
     std::string source_id = "rtc0";
     bool enabled = false;
     int priority = 40;
-    std::string device;            ///< 空 = 自动检测 (/dev/rtc0)
+    std::string device;            ///< 空 = 自动检测 (/dev/rtc，内核指定的系统 RTC)
     bool require_provisioned = true; ///< provision 证据接口登记缺口
     int64_t error_upper_ms = 500;
     int64_t drift_upper_ppm = 50;
@@ -69,7 +69,11 @@ struct RtcSourceConfig {
 /// 平台来源检测（真实代码，缺硬件返回 unsupported；非 Linux 平台 RTC/GNSS/蜂窝 unsupported）。
 SourceCapability detectCellularModule(std::string* detail);
 SourceCapability detectGnssModule(std::string* detail);
-SourceCapability detectRtcModule(std::string* detail);
+/// RTC 探测必须与读取用同一设备路径（device 为空 = /dev/rtc，内核指定的系统 RTC）。
+SourceCapability detectRtcModule(std::string* detail,
+                                 const std::string& device = std::string());
+/// 解析 RTC 设备路径（空配置 → /dev/rtc）。
+std::string rtcDevicePath(const std::string& configured);
 
 /// 蜂窝来源适配器。无模块 → unsupported 且不启动；
 /// 有模块但厂商协议未登记 → start 失败并保留缺口说明（不占位标完成）。

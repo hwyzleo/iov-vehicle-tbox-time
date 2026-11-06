@@ -160,5 +160,68 @@ TEST(Snapshot, JsonRoundTrip) {
               std::string::npos);
 }
 
+// CR-002：新增 TimeReason（append-only）名称与 JSON 序列化。
+TEST(Snapshot, ObserveReasonsSerialized) {
+    EXPECT_STREQ(timeReasonName(TimeReason::kObservedSynchronized),
+                 "observed_synchronized");
+    EXPECT_STREQ(timeReasonName(TimeReason::kObserverInterfaceUnavailable),
+                 "observer_interface_unavailable");
+    EXPECT_STREQ(timeReasonName(TimeReason::kObserverEvidenceUnavailable),
+                 "observer_evidence_unavailable");
+
+    TimeSnapshot s;
+    s.contract_version = kContractVersion;
+    s.daemon_epoch = 1;
+    s.event_sequence = 1;
+    s.state = TimeState::kSynced;
+    s.synchronized = true;
+    s.reason = TimeReason::kObservedSynchronized;
+    s.source_id = "system-timesyncd";
+    s.source_kind = SourceKind::kNtpNetwork;
+    s.utc_valid = true;
+    s.utc_epoch_ms = 1'700'000'000'000;
+    s.uncertainty_valid = true;
+    s.uncertainty_ms = 201;
+    s.auth_status = AuthStatus::kUnverified;
+    EXPECT_TRUE(s.validate());
+    const std::string json = snapshotToJson(s, IpcStatus::kOk);
+    EXPECT_NE(json.find("\"reason\":\"observed_synchronized\""),
+              std::string::npos);
+
+    // 事件载荷同样携带新 reason。
+    TimeStateEvent ev;
+    ev.daemon_epoch = 1;
+    ev.event_sequence = 2;
+    ev.old_state = TimeState::kSyncing;
+    ev.new_state = TimeState::kSynced;
+    ev.reason = TimeReason::kObservedSynchronized;
+    ev.source_id = "system-timesyncd";
+    ev.source_kind = SourceKind::kNtpNetwork;
+    ev.utc_valid = true;
+    ev.utc_epoch_ms = 1'700'000'000'000;
+    ev.uncertainty_valid = true;
+    ev.uncertainty_ms = 201;
+    ev.auth_status = AuthStatus::kUnverified;
+    EXPECT_TRUE(ev.validate());
+    const std::string evjson = eventToJson(ev);
+    EXPECT_NE(evjson.find("\"reason\":\"observed_synchronized\""),
+              std::string::npos);
+}
+
+// 旧 reason 数值/名称不因 append-only 追加而变化（兼容能力，AT-03/AT-04）。
+TEST(Snapshot, ExistingReasonValuesUnchanged) {
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kNone), 0u);
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kInitial), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kPolicyViolation), 15u);
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kObservedSynchronized), 16u);
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kObserverInterfaceUnavailable),
+              17u);
+    EXPECT_EQ(static_cast<uint8_t>(TimeReason::kObserverEvidenceUnavailable),
+              18u);
+    // 旧 reason 名称不变
+    EXPECT_STREQ(timeReasonName(TimeReason::kAlignmentVerified),
+                 "alignment_verified");
+}
+
 }  // namespace time
 }  // namespace tbox
